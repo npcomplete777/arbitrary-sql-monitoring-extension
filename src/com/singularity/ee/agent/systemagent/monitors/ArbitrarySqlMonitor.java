@@ -1,45 +1,47 @@
 package com.singularity.ee.agent.systemagent.monitors;
 
+import com.appdynamics.extensions.PathResolver;
+import com.appdynamics.extensions.yml.YmlReader;
+import com.google.common.base.Strings;
 import com.singularity.ee.agent.systemagent.api.AManagedMonitor;
 import com.singularity.ee.agent.systemagent.api.MetricWriter;
 import com.singularity.ee.agent.systemagent.api.TaskExecutionContext;
 import com.singularity.ee.agent.systemagent.api.TaskOutput;
 import com.singularity.ee.agent.systemagent.api.exception.TaskExecutionException;
-import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-
+import java.io.File;
 import java.sql.*;
 import java.util.HashMap;
 import java.util.Map;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import org.joda.time.DateTime;
 
 public class ArbitrarySqlMonitor extends AManagedMonitor
 {
+	public String metricPrefix;
+    public static final String CONFIG_ARG = "config-file";
+    public static final String LOG_PREFIX = "log-prefix";
+    private static String logPrefix;
     private static final Log logger = LogFactory.getLog(ArbitrarySqlMonitor.class);
-
     private boolean cleanFieldNames;
-    private String driverClass;
-    private String metricPath;
-    private String username;
-    private String password;
-    private String url;
-    private String database;
-    private String sql;
-
-
-    private String getArg(Map<String, String> map, String key, String defaultValue)
-    {
-        return map.containsKey(key) ? map.get(key) : defaultValue;
-    }
-
-    private String getArg(Map<String, String> map, String key)
-    {
-        if (!map.containsKey(key))
-        {
-            throw new IllegalArgumentException(key);
-        }
-        return map.get(key);
-    }
+    private String metricPath;  
+    private String dateStampFromFile = null; 
+    boolean hasDateStamp = false;
+    BufferedReader br = null;
+    private String relativePath = null;
+	private DateTime timeLastExecuted = new DateTime(new DateTime());
+	private String timeper_in_sec = null;
+	private String execution_freq_in_secs = null;
+	
+	DateTime currentTime = new DateTime(new DateTime());
+	float diffInMillis = -1.0F;
+	Float DiffInSec = null;
+    boolean skippedMetricWrite = false;
 
     protected void printMetric(String name, String value, String aggType, String timeRollup, String clusterRollup)
     {
@@ -47,11 +49,9 @@ public class ArbitrarySqlMonitor extends AManagedMonitor
         MetricWriter metricWriter = getMetricWriter(metricName, aggType, timeRollup, clusterRollup);
         metricWriter.printMetric(value);
 
-        // just for debug output
         if (logger.isDebugEnabled())
         {
-            logger.debug("METRIC:  NAME:" + metricName + " VALUE:" + value + " :" + aggType + ":" + timeRollup + ":"
-                    + clusterRollup);
+            logger.debug("METRIC:  NAME:" + metricName + " VALUE:" + value + " :" + aggType + ":" + timeRollup + ":" + clusterRollup);
         }
     }
 
@@ -72,125 +72,426 @@ public class ArbitrarySqlMonitor extends AManagedMonitor
             return name;
         }
     }
+    
+    private void processMetricPrefix(String metricPrefix) 
+    {
 
-    public TaskOutput execute(Map<String, String> taskParams, TaskExecutionContext taskContext)
-            throws TaskExecutionException
+        if (!metricPrefix.endsWith("|")) 
+        {
+            metricPrefix = metricPrefix + "|";
+        }
+        if (!metricPrefix.startsWith("Custom Metrics|")) {
+            metricPrefix = "Custom Metrics|" + metricPrefix;
+        }
+        this.metricPrefix = metricPrefix;
+    }
+    
+    public TaskOutput execute(Map<String, String> taskArguments, TaskExecutionContext taskContext) throws TaskExecutionException 
+    {	
+    	Long timeper_in_secConv = null;
+    	Long execution_freq_in_secsConv = null;
+    	
+    	//relativePath for reading/writing time stamp that tracks last execution of queries
+    	relativePath = taskArguments.get("machineAgent-relativePath");
+		relativePath += "\\monitors\\ArbitrarySqlMonitor\\timeStamp.txt";
+		
+		File file = new File(relativePath);
+    	FileWriter fw;
+    	logger.info("path: " + relativePath);
+    	
+    	timeper_in_sec = taskArguments.get("timeper_in_sec");
+		execution_freq_in_secs = taskArguments.get("execution_freq_in_secs");
+		timeper_in_secConv = Long.valueOf(timeper_in_sec).longValue();
+		execution_freq_in_secsConv = Long.valueOf(execution_freq_in_secs).longValue();
+		logger.info("timePeriod_in_sec: " + timeper_in_sec);
+		
+        if (taskArguments != null) 
+        {
+        	try 
+        	{	 	
+    			String sCurrentLine;
+     
+    			br = new BufferedReader(new FileReader("C:\\MA5\\MachineAgent\\monitors\\ArbitrarySqlMonitor\\timeStamp.txt"));
+    			
+    			//execution frequency should always greater than time period passed into queries to prevent duplicate data
+    			if(execution_freq_in_secsConv < timeper_in_secConv)
+    			{
+    				logger.error("CANNOT set execution_freq_in_secs in monitor.xml to a lesser value than timeper_in_sec");
+    				logger.error("execution_freq_in_secs: " + execution_freq_in_secs);
+    				logger.error("timeper_in_sec: " + timeper_in_sec);
+    			}
+    							
+    			if(br != null)
+    			{ 			 
+    				while ((sCurrentLine = br.readLine()) != null) 
+    				{  		
+    					dateStampFromFile = sCurrentLine; 					
+    					timeLastExecuted = DateTime.parse(dateStampFromFile);
+    				}   			
+    			}
+    		
+    		} 
+        	catch (IOException e) 
+    		{
+    			e.printStackTrace(); 
+    		} finally 
+    		{
+    			try 
+    			{
+    				if (br != null)br.close();
+    			} 
+    			catch (IOException ex) 
+    			{
+    				ex.printStackTrace();
+    			}
+    		}
+        	
+            setLogPrefix(taskArguments.get(LOG_PREFIX));
+            logger.info(getLogPrefix() + "Starting the SQL Monitoring task.");
+            
+            if (logger.isDebugEnabled()) 
+            {
+                logger.debug(getLogPrefix() + "Task Arguments Passed ::" + taskArguments);
+            }
+            String status = "Success";
+            String configFilename = getConfigFilename(taskArguments.get(CONFIG_ARG));
+
+            try 
+            {
+            	fw = new FileWriter(file.getAbsoluteFile());
+        		BufferedWriter bw = new BufferedWriter(fw);       		
+        		
+                Configuration config = YmlReader.readFromFile(configFilename, Configuration.class);
+
+                if (config.getCommands().isEmpty()) 
+                {
+                    return new TaskOutput("Failure");
+                }
+                
+                logger.info("metric path: " + config.getMetricPrefix());
+                processMetricPrefix(config.getMetricPrefix());
+  
+                logger.info("instant time (current time): " + currentTime);
+                logger.info("old time (Time last executed query): " + timeLastExecuted);
+                
+                diffInMillis = Math.abs(timeLastExecuted.getMillis() - currentTime.getMillis());
+            	float diffInSec = diffInMillis / 1000;
+                float diffInMin = diffInSec / 60;
+                float diffInHours = diffInMin / 60;                
+                
+                if(timeper_in_secConv > diffInSec)
+                {
+                	logger.info("execution frequency > time between query execution; no duplicate data.  Time in Minutes since last execution of queries: " + diffInMin );         	                	
+                    logger.info("execution frequency in seconds: " + timeper_in_secConv);
+                    logger.info("Time in sec: " + diffInSec);                  
+                	               	
+                	timeLastExecuted = new DateTime();              
+                	bw.write(timeLastExecuted.toString());
+                	bw.close();
+                	logger.info("date written to file: " + timeLastExecuted.toString());
+                	
+                	skippedMetricWrite = false;
+                	status = executeCommands(config, status);                	                	
+                }
+                else if(timeper_in_secConv <= diffInSec)
+                {
+                	logger.info("(execution frequency < diffInSec; Metric data will NOT be written to ensure no duplicate data");    	               	                             
+                    logger.info("Time in sec: " + diffInSec);                                       
+                    timeLastExecuted = new DateTime();
+                	bw.write(timeLastExecuted.toString());
+                	bw.close();
+                	
+                	//store this in instance variable, then pass value into queries
+                	DiffInSec = diffInSec;
+                	
+                	logger.info("execution frequency < diffInMin; DiffInSec variable value: " + DiffInSec);
+                	skippedMetricWrite = true;
+                	status = executeCommands(config, status);                	
+                }                                              
+            }
+            catch (Exception ioe) 
+            {
+                logger.error("Exception", ioe);
+            }
+
+            return new TaskOutput(status);
+        }
+        throw new TaskExecutionException(getLogPrefix() + "SQL monitoring task completed with failures.");
+    }
+  
+    private String executeCommands(Configuration config, String status) 
     {
         Connection conn = null;
+        
+        try 
+        {
+            for (Server server : config.getServers()) 
+            {
+                conn = connect(server);
+
+                for (Command command : config.getCommands()) 
+                {
+                    try 
+                    {
+                        int counter = 1;
+                        logger.info("sql statement: " + counter++);
+                        String statement = command.getCommand().trim();
+                        String displayPrefix = command.getDisplayPrefix();
+                        
+                        if (statement != null) 
+                        {                       	
+                            // parse into statement and roll up
+                            logger.info("Running " + statement);                        
+                            executeQuery(conn, statement, displayPrefix);
+                        } 
+                        else 
+                        {
+                            logger.error("Didn't find statement: " + counter);
+                        }
+                    } 
+                    catch (Exception e) 
+                    {
+                        e.printStackTrace();
+                    }
+                }
+                if (conn != null) 
+                {
+                    try 
+                    {
+                        conn.close();
+                    } catch (SQLException e) 
+                    {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        } 
+        catch (SQLException sqle) 
+        {
+            logger.error("SQLException: ", sqle);
+            status = "Failure";
+        } 
+        catch (ClassNotFoundException ce) 
+        {
+            logger.error("Class not found: ", ce);
+            status = "Failure";
+        } finally 
+        {
+            if (conn != null) try 
+            {
+                conn.close();
+            } 
+            catch (SQLException e) 
+            {
+                e.printStackTrace();
+            }
+        }
+        return status;
+    }
+
+    private Data executeQuery(Connection conn, String query, String displayPrefix) 
+    {
+        Data retval = new Data();
         Statement stmt = null;
         ResultSet rs = null;
-
-        try
+        String newQuery = null;
+        
+        try 
         {
-            logger.info("Starting arbitrary SQL execution monitor");
-
-            cleanFieldNames = Boolean.parseBoolean(getArg(taskParams, "clean-field-names", "true"));
-            metricPath = getArg(taskParams, "metric-path", null);
-            driverClass = getArg(taskParams, "driver-class", null);
-            username = getArg(taskParams, "username", null);
-            password = getArg(taskParams, "password", null);
-            database = getArg(taskParams, "database", null);
-            url = getArg(taskParams, "url");
-            sql = getArg(taskParams, "sql");
-
-            if (StringUtils.isNotEmpty(driverClass))
+        	logger.info("dateStamp: " + dateStampFromFile);
+        	
+        	long rowCount10 = 0;
+            stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+            
+            if(query.contains("freqInSec"))
             {
-                logger.info("Loading JDBC driver class " + driverClass);
-                Class.forName(driverClass);
+            	logger.info("query contains freqInSec - if loop hit ");
+            	
+            	if(skippedMetricWrite == false)
+            	{
+            		newQuery = query.replace("freqInSec", timeper_in_sec);
+                	rs = stmt.executeQuery(newQuery);
+                	logger.info("query with timeDate replaced: " + newQuery);
+            	}
+            	else if(skippedMetricWrite == true)
+            	{
+            		String DiffInSecString = DiffInSec.toString();
+            		newQuery = query.replace("freqInSec", DiffInSecString);
+                	rs = stmt.executeQuery(newQuery);
+                	logger.info("query with timeDate replaced: " + newQuery);
+                	skippedMetricWrite = false;
+            	}           	
             }
-
-            logger.info("Opening connection to " + url);
-            long startTime = System.currentTimeMillis();
-            conn = DriverManager.getConnection(url, username, password);
-            if (StringUtils.isNotEmpty(database))
+            else
             {
-                logger.info("Changing catalog to " + database);
-                conn.setCatalog(database);
+            	rs = stmt.executeQuery(query);
+                logger.info("SQL query is suitable for monitoring; NO freqInSec set in monitor.xml...");
+                logger.info("display prefix: " + displayPrefix);
             }
-            long elapsedTime = System.currentTimeMillis() - startTime;
-
-            printMetric("Connection Time (ms)", Long.toString(elapsedTime),
-                    MetricWriter.METRIC_AGGREGATION_TYPE_OBSERVATION,
-                    MetricWriter.METRIC_TIME_ROLLUP_TYPE_CURRENT,
-                    MetricWriter.METRIC_CLUSTER_ROLLUP_TYPE_COLLECTIVE);
-            logger.debug("Connection time = " + elapsedTime);
-
-            logger.info("Executing query: " + sql);
-            startTime = System.currentTimeMillis();
-            stmt = conn.createStatement();
-            rs = stmt.executeQuery(sql);
-
-            logger.info("Reading results");
-            long rowCount = 0;
-            while (rs.next())
+            
+            //get row and column count of result set
+            int rowCount = 0;
+            while (rs.next()) 
             {
-                String key = cleanFieldName(rs.getString(1));
-
-                for (int i = 2; i <= rs.getMetaData()
-                        .getColumnCount(); i++)
-                {
-                    String metricName = cleanFieldName(rs.getMetaData()
-                            .getColumnName(i));
-                    printMetric(key + "|" + metricName, rs.getString(i),
+                ++rowCount;              
+            }
+            logger.info("row count of resultset: " + rowCount);
+            
+            ResultSetMetaData rsmd = rs.getMetaData();
+            int columnCount = rsmd.getColumnCount();
+            logger.info("column count: " + columnCount);
+            
+            //set cursor to beginning
+            rs.beforeFirst();
+            
+            //this deals with the single row/column case
+            if(columnCount == 1 && rowCount == 1)
+            {           	           	
+            	if(rs.next())
+            	{
+            		String key = cleanFieldName(rs.getString(1));
+                	String metricPreF = metricPrefix + displayPrefix;
+            		String metricName = cleanFieldName(rs.getMetaData().getColumnName(1));              	              	
+                    String value = rs.getString(1);
+                    ResultSetMetaData metaData = rs.getMetaData();
+                    String name = metaData.getColumnLabel(1);
+                    retval.setName(name);
+                    retval.setValue(value);
+                                     
+            		printMetricArb(metricPreF + "|" + key + "|" + metricName, rs.getString(1),
                             MetricWriter.METRIC_AGGREGATION_TYPE_OBSERVATION,
                             MetricWriter.METRIC_TIME_ROLLUP_TYPE_CURRENT,
                             MetricWriter.METRIC_CLUSTER_ROLLUP_TYPE_COLLECTIVE);
-                    logger.debug(key + "|" + metricName + " = " + rs.getString(i));
-                }
-
-                rowCount += 1;
+                    logger.debug(key + "|" + metricName + " = " + rs.getString(1));
+                    logger.info("metric key: " + key);	                    
+                    logger.info("metric path: " +metricPreF + "|" + key + "|" + metricName);
+            	}
             }
-
-            elapsedTime = System.currentTimeMillis() - startTime;
-            printMetric("Execution Time (ms)", Long.toString(elapsedTime),
-                    MetricWriter.METRIC_AGGREGATION_TYPE_OBSERVATION,
-                    MetricWriter.METRIC_TIME_ROLLUP_TYPE_CURRENT,
-                    MetricWriter.METRIC_CLUSTER_ROLLUP_TYPE_COLLECTIVE);
-            logger.debug("Execution time = " + elapsedTime);
-
-            printMetric("Rows Returned", Long.toString(rowCount),
-                    MetricWriter.METRIC_AGGREGATION_TYPE_OBSERVATION,
-                    MetricWriter.METRIC_TIME_ROLLUP_TYPE_CURRENT,
-                    MetricWriter.METRIC_CLUSTER_ROLLUP_TYPE_COLLECTIVE);
-            logger.debug("Rows returned = " + rowCount);
-
-            logger.info("Query completed successfully");
-        }
-        catch (ClassNotFoundException e)
+            // multi row columns returned 
+            else
+            {           	
+	            while(rs.next())
+	            {
+	            	String key = cleanFieldName(rs.getString(1));
+	            	
+	            	for (int i = 2; i <= rs.getMetaData().getColumnCount(); i++)
+	            	{           			
+	            		String metricPreF = metricPrefix + displayPrefix;
+	            		String metricName = cleanFieldName(rs.getMetaData().getColumnName(i));
+	            		
+	            		retval.setName(metricName);
+	            		retval.setValue(rs.getString(i));            	
+	            		
+	            		printMetricArb(metricPreF + "|" + key + "|" + metricName, rs.getString(i),
+	                            MetricWriter.METRIC_AGGREGATION_TYPE_OBSERVATION,
+	                            MetricWriter.METRIC_TIME_ROLLUP_TYPE_CURRENT,
+	                            MetricWriter.METRIC_CLUSTER_ROLLUP_TYPE_COLLECTIVE);
+	                    logger.debug(key + "|" + metricName + " = " + rs.getString(i));
+	                    logger.info("metric key: " + key);	                    
+	                    logger.info("metric path: " +metricPreF + "|" + key + "|" + metricName);	            	
+	            	}
+	            	rowCount10 += 1;   	
+	            }          
+            }         
+        } 
+        catch (SQLException sqle) 
         {
-            logger.error("Unable to load JDBC driver " + driverClass, e);
-            return null;
-        }
-        catch (SQLException e)
+            logger.error("SQLException: ", sqle);
+            logger.error("timeper_in_sec (value passed to replace freqInSec): " + timeper_in_sec);
+        } 
+        finally 
         {
-            logger.error("SQL exception", e);
-            return null;
-        }
-        catch (IllegalArgumentException e)
-        {
-            logger.fatal("Required parameter not specified in monitor.xml: " + e.getMessage());
-            return null;
-        }
-        finally
-        {
-            logger.info("Closing connection");
-
-            try
+            if (rs != null) try 
             {
-                if (rs != null)
-                    rs.close();
-                if (stmt != null)
-                    stmt.close();
-                if (conn != null)
-                    conn.close();
-            }
-            catch (Exception e)
-            {
-                logger.error("Error cleaning up: " + e.getMessage(), e);
-            }
+                rs.close();
+            } 
+            catch (SQLException e) 
+            {}
+            if (stmt != null) 
+            	try 
+            	{
+            		stmt.close();
+            	} 
+            	catch (SQLException e) {}
         }
+        return retval;
+    }
 
-        return new TaskOutput("Success");
+    private Connection connect(Server server) throws SQLException, ClassNotFoundException 
+    {
+        Connection conn = null;
+        String driver = server.getDriver();
+        String connectionString = server.getConnectionString();
+        String user = server.getUser();
+        String password = server.getPassword();
+
+        if (driver != null && connectionString != null) 
+        {
+            Class.forName(driver);
+            conn = DriverManager.getConnection(connectionString, user, password);
+            logger.info("Got connection " + conn);
+        }
+        return conn;
+    }
+    
+    public void printMetric(Data data, String displayPrefix) 
+    {
+        String metricName = metricPrefix + displayPrefix.concat("|") + data.getName();
+
+        // don't write empty data
+        if (data.getValue() != null) 
+        {
+            logger.info("Data " + data);
+            // default roll ups
+            String aggregationType = MetricWriter.METRIC_AGGREGATION_TYPE_AVERAGE;
+            String timeRollup = MetricWriter.METRIC_TIME_ROLLUP_TYPE_AVERAGE;
+            String clusterRollup = MetricWriter.METRIC_CLUSTER_ROLLUP_TYPE_INDIVIDUAL;
+            MetricWriter writer = getMetricWriter(metricName, aggregationType, timeRollup, clusterRollup);
+            writer.printMetric(data.getValue());
+        }
+    }
+    
+    protected void printMetricArb(String name, String value, String aggType, String timeRollup, String clusterRollup)
+    {
+    	String metricName = name;
+        MetricWriter metricWriter = getMetricWriter(metricName, aggType, timeRollup, clusterRollup);
+        metricWriter.printMetric(value);
+
+        if (logger.isDebugEnabled())
+        {
+            logger.debug("METRIC:  NAME:" + metricName + " VALUE:" + value + " :" + aggType + ":" + timeRollup + ":"
+                    + clusterRollup);
+        }
+    }
+
+    private String getConfigFilename(String filename) 
+    {
+        if (filename == null) 
+        {
+            return "";
+        }
+        //for absolute paths
+        if (new File(filename).exists()) 
+        {
+            return filename;
+        }
+        //for relative paths
+        File jarPath = PathResolver.resolveDirectory(AManagedMonitor.class);
+        String configFileName = "";
+        if (!Strings.isNullOrEmpty(filename)) 
+        {
+            configFileName = jarPath + File.separator + filename;
+        }
+        return configFileName;
+    }
+
+    private String getLogPrefix() 
+    {
+        return logPrefix;
+    }
+
+    private void setLogPrefix(String logPrefix) {
+        this.logPrefix = (logPrefix != null) ? logPrefix : "";
     }
 
     protected String getMetricPrefix()
@@ -209,20 +510,16 @@ public class ArbitrarySqlMonitor extends AManagedMonitor
         }
     }
 
-
-    public static void main(String[] argv)
-            throws Exception
+    public static void main(String[] argv) throws Exception
     {
-        Map<String, String> taskParams = new HashMap<String, String>();
-        taskParams.put("driver-class", "com.mysql.MysqlDriver");
-        taskParams.put("url", "jdbc:mysql://localhost:3306");
-        taskParams.put("database", "controller");
-        taskParams.put("username", "root");
-        taskParams.put("password", "PASSWORD");
-        taskParams.put("metric-path", "Server|Component:ArbitrarySqlMonitor|SolarWinds");
-        taskParams.put("sql",
-                "SELECT Nodes.Caption AS NodeName, Nodes.CPULoad AS CPU_Load, Nodes.PercentMemoryUsed AS PercentMemoryUsed " +
-                        " FROM Nodes WHERE ((Nodes.Hourly_Dash_Relevant = 1) AND (Nodes.CPULoad > -1))");
-        new ArbitrarySqlMonitor().execute(taskParams, null);
+    	Map<String, String> taskArguments = new HashMap<String, String>();
+    	taskArguments.put("config-file", "c:\\MA5\\MachineAgent\\monitors\\ArbitrarySQLMonitor\\config.yml");
+    	taskArguments.put("log-prefix", "[SQLMonitorAppDExt]");
+    	taskArguments.put("machineAgent-relativePath", "c:\\MA5\\MachineAgent");
+    	
+    	taskArguments.put("timeper_in_sec", "121");
+    	taskArguments.put("execution_freq_in_secs", "240");
+    	
+        new ArbitrarySqlMonitor().execute(taskArguments, null);
     }
 }
